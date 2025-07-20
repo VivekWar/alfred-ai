@@ -1,102 +1,177 @@
 const puppeteer = require('puppeteer');
-require('dotenv').config();
+const cheerio = require('cheerio');
+const validator = require('../bot/utils/validator');
+const logger = require('../bot/utils/logger');
+const { SCRAPING } = require('../config/constants');
 
 class FacebookMarketplaceScraper {
   async scrape() {
-    const browser = await puppeteer.launch({
-      headless: false, // Set to true for production
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
-    });
-
+    let browser;
     try {
-      const page = await browser.newPage();
-      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
-
-      // Navigate to Facebook login
-      await page.goto('https://www.facebook.com/login');
+      logger.info('Starting Facebook Marketplace scraping...');
       
-      // Login with dummy account
-      await page.type('#email', process.env.FACEBOOK_EMAIL);
-      await page.type('#pass', process.env.FACEBOOK_PASSWORD);
-      await page.click('#loginbutton');
-      
-      // Wait for login
-      await page.waitForNavigation();
-
-      // Navigate to marketplace
-      const marketplaceUrl = 'https://www.facebook.com/marketplace/107286902636860/search?query=room%20to%20rent';
-      await page.goto(marketplaceUrl);
-      
-      // Wait for listings to load
-      await page.waitForSelector('[data-testid="marketplace-product-item"]', { timeout: 10000 });
-
-      // Scroll to load more listings
-      for (let i = 0; i < 3; i++) {
-        await page.evaluate(() => window.scrollBy(0, 1000));
-        await page.waitForTimeout(2000);
-      }
-
-      // Extract listings
-      const listings = await page.evaluate(() => {
-        const items = document.querySelectorAll('[data-testid="marketplace-product-item"]');
-        const results = [];
-
-        items.forEach((item, index) => {
-          try {
-            const titleElement = item.querySelector('span[dir="auto"]');
-            const priceElement = item.querySelector('span[dir="auto"]'); // Price usually in first span
-            const locationElement = item.querySelector('span[dir="auto"]:last-child');
-            const linkElement = item.querySelector('a');
-            const imageElement = item.querySelector('img');
-
-            if (titleElement && linkElement) {
-              results.push({
-                title: titleElement.textContent.trim(),
-                price: priceElement ? this.extractPrice(priceElement.textContent) : null,
-                location: locationElement ? locationElement.textContent.trim() : 'Bali',
-                rooms: this.extractRooms(titleElement.textContent),
-                furnished: this.extractFurnished(titleElement.textContent),
-                description: titleElement.textContent.trim(),
-                image_urls: imageElement ? [imageElement.src] : [],
-                listing_url: 'https://www.facebook.com' + linkElement.getAttribute('href'),
-                source: 'Facebook Marketplace'
-              });
-            }
-          } catch (error) {
-            console.warn('Error parsing listing:', error);
-          }
-        });
-
-        return results.slice(0, 20); // Limit to 20 listings
+      browser = await puppeteer.launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--disable-gpu'
+        ]
       });
 
-      return listings;
+      const page = await browser.newPage();
+      await page.setUserAgent(SCRAPING.USER_AGENTS[0]);
+      await page.setViewport({ width: 1366, height: 768 });
+
+      // Navigate to Facebook Marketplace Bali
+      await page.goto('https://www.facebook.com/marketplace/bali/propertyrentals', {
+        waitUntil: 'networkidle2',
+        timeout: SCRAPING.TIMEOUT
+      });
+
+      // Wait for listings to load
+      await page.waitForTimeout(5000);
+
+      // Try multiple selectors for marketplace listings
+      const selectors = [
+        '[data-testid="marketplace-item"]',
+        '[data-testid="marketplace-product-item"]',
+        'div[role="main"] a[href*="/marketplace/item/"]',
+        '.x1lliihq.x6ikm8r.x10wlt62'
+      ];
+
+      let listings = [];
+      let workingSelector = null;
+
+      for (const selector of selectors) {
+        try {
+          console.log(`Trying selector: ${selector}`);
+          await page.waitForSelector(selector, { timeout: 10000 });
+          const items = await page.$$(selector);
+          
+          if (items.length > 0) {
+            workingSelector = selector;
+            console.log(`✅ Found ${items.length} items with selector: ${selector}`);
+            
+            // Extract listing data
+            listings = await page.evaluate((sel) => {
+              const items = document.querySelectorAll(sel);
+              const results = [];
+              
+              items.forEach((item, index) => {
+                if (index >= 20) return; // Limit to 20 items
+                
+                try {
+                  const link = item.href || item.querySelector('a')?.href;
+                  const title = item.querySelector('span, div')?.textContent?.trim();
+                  const priceElement = item.querySelector('[data-testid="marketplace-price"]') || 
+                                     item.querySelector('span:contains("Rp")') ||
+                                     item.querySelector('span:contains("$")');
+                  const price = priceElement?.textContent?.trim();
+                  const location = item.querySelector('[data-testid="marketplace-location"]')?.textContent?.trim();
+                  const image = item.querySelector('img')?.src;
+                  
+                  if (link && title && title.length > 10) {
+                    results.push({
+                      title,
+                      price,
+                      location,
+                      link,
+                      image
+                    });
+                  }
+                } catch (e) {
+                  console.log('Error extracting item:', e);
+                }
+              });
+              
+              return results;
+            }, selector);
+            
+            break;
+          }
+        } catch (error) {
+          console.log(`❌ Selector ${selector} failed:`, error.message);
+          continue;
+        }
+      }
+
+      if (listings.length === 0) {
+        logger.warn('No Facebook Marketplace listings found');
+        return [];
+      }
+
+      // Process and format listings
+      const formattedListings = listings.map(item => {
+        const price = validator.extractPrice(item.price || '');
+        
+        return {
+          title: validator.sanitizeText(item.title),
+          price: price,
+          location: this.extractLocation(item.location || item.title),
+          rooms: this.extractRooms(item.title),
+          furnished: this.extractFurnished(item.title),
+          description: validator.sanitizeText(item.title),
+          image_urls: item.image ? [item.image] : [],
+          listing_url: item.link,
+          source: 'Facebook Marketplace',
+          scraped_at: new Date().toISOString()
+        };
+      }).filter(listing => validator.validateListing(listing).isValid);
+
+      logger.info(`Facebook Marketplace scraped ${formattedListings.length} listings`);
+      return formattedListings;
+
     } catch (error) {
-      console.error('Facebook Marketplace scraping error:', error);
-      throw error;
+      logger.error('Facebook Marketplace scraping error:', error);
+      return [];
     } finally {
-      await browser.close();
+      if (browser) {
+        await browser.close();
+      }
     }
   }
 
-  extractPrice(text) {
-    const priceMatch = text.match(/[\$Rp,.\d]+/);
-    if (priceMatch) {
-      const price = priceMatch[0].replace(/[^\d]/g, '');
-      return parseInt(price) || null;
+  extractLocation(text) {
+    if (!text) return 'Bali';
+    
+    const locations = [
+      'canggu', 'seminyak', 'ubud', 'sanur', 'denpasar',
+      'kuta', 'legian', 'jimbaran', 'nusa dua', 'uluwatu'
+    ];
+    
+    const lowerText = text.toLowerCase();
+    for (const location of locations) {
+      if (lowerText.includes(location)) {
+        return location.charAt(0).toUpperCase() + location.slice(1);
+      }
     }
-    return null;
+    return 'Bali';
   }
 
   extractRooms(text) {
-    const roomMatch = text.match(/(\d+)\s*(room|bedroom|br)/i);
-    return roomMatch ? parseInt(roomMatch[1]) : 1;
+    if (!text) return 1;
+    if (/studio/i.test(text)) return 0;
+    
+    const match = text.match(/(\d+)\s*(?:bedroom|bed|room|br)/i);
+    if (match) {
+      const rooms = parseInt(match[1]);
+      return rooms >= 0 && rooms <= 10 ? rooms : 1;
+    }
+    return 1;
   }
 
   extractFurnished(text) {
-    const furnished = /furnished/i.test(text);
-    const unfurnished = /unfurnished/i.test(text);
-    return furnished ? true : unfurnished ? false : null;
+    if (!text) return null;
+    const lowerText = text.toLowerCase();
+    
+    if (lowerText.includes('furnished')) return true;
+    if (lowerText.includes('unfurnished')) return false;
+    return null;
   }
 }
 

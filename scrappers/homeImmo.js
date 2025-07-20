@@ -1,30 +1,39 @@
-const axios = require('axios');
+const puppeteer = require('puppeteer');
 const cheerio = require('cheerio');
 const validator = require('../bot/utils/validator');
 const logger = require('../bot/utils/logger');
+const { SCRAPING } = require('../config/constants');
 
 class HomeImmoScraper {
   async scrape() {
+    let browser;
     try {
       logger.info('Starting Bali Home Immo scraping...');
       
-      const response = await axios.get(
-        'https://bali-home-immo.com/realestate-property/for-rent/villa-house/monthly',
-        {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-          },
-          timeout: 15000
-        }
-      );
+      browser = await puppeteer.launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage'
+        ]
+      });
 
-      const $ = cheerio.load(response.data);
+      const page = await browser.newPage();
+      await page.setUserAgent(SCRAPING.USER_AGENTS[0]);
+      await page.setExtraHTTPHeaders({
+        'Accept-Language': 'en-US,en;q=0.9'
+      });
+
+      await page.goto('https://bali-home-immo.com/realestate-property/for-rent/villa-house/monthly', {
+        waitUntil: 'networkidle2',
+        timeout: SCRAPING.TIMEOUT
+      });
+
+      const content = await page.content();
+      const $ = cheerio.load(content);
       const listings = [];
 
-      // Try multiple selectors for property listings
       const propertySelectors = [
         '.property-item',
         '.property-listing',
@@ -45,41 +54,42 @@ class HomeImmoScraper {
           logger.info(`Found ${items.length} properties with selector: ${selector}`);
 
           items.each((i, element) => {
+            if (i >= SCRAPING.MAX_LISTINGS_PER_SOURCE) return false;
+            
             try {
               const $el = $(element);
               const listing = this.extractListingData($el, $);
               
-              if (listing && this.isValidListing(listing)) {
+              if (listing && validator.validateListing(listing).isValid) {
                 listings.push(listing);
               }
             } catch (error) {
-              logger.warn('Error extracting listing data:', error);
+              logger.warn('Error extracting listing data:', error.message);
             }
           });
           
-          break; // Use first working selector
+          break;
         }
       }
 
-      // Fallback scraping if no structured listings found
       if (!foundItems || listings.length === 0) {
         logger.info('No structured listings found, trying fallback method');
         const fallbackListings = this.fallbackScraping($);
         listings.push(...fallbackListings);
       }
 
-      logger.info(`Home Immo scraped ${listings.length} listings`);
-      return listings.slice(0, 15);
+      const uniqueListings = this.deduplicateListings(listings);
+      logger.info(`Home Immo scraped ${uniqueListings.length} listings`);
+      
+      return uniqueListings;
 
     } catch (error) {
       logger.error('Home Immo scraping error:', error);
-      
-      // Return sample data in development
-      if (process.env.NODE_ENV === 'development') {
-        return this.getSampleData();
-      }
-      
       return [];
+    } finally {
+      if (browser) {
+        await browser.close();
+      }
     }
   }
 
@@ -105,19 +115,11 @@ class HomeImmoScraper {
     ]);
 
     const link = $el.find('a').first().attr('href') ||
-                $el.closest('a').attr('href');
+                 $el.closest('a').attr('href');
 
-    const images = [];
-    $el.find('img').each((i, img) => {
-      const src = $(img).attr('src') || $(img).attr('data-src') || $(img).attr('data-lazy');
-      if (src && this.isValidImage(src)) {
-        images.push(this.normalizeUrl(src));
-      }
-    });
+    const images = this.extractImages($el, $);
 
-    if (!title || !link) {
-      return null;
-    }
+    if (!title || !link) return null;
 
     return {
       title: validator.sanitizeText(title),
@@ -128,22 +130,18 @@ class HomeImmoScraper {
       description: validator.sanitizeText(description || title),
       image_urls: images.slice(0, 3),
       listing_url: this.normalizeUrl(link),
-      source: 'Bali Home Immo'
+      source: 'Bali Home Immo',
+      scraped_at: new Date().toISOString()
     };
   }
 
   findText($el, selectors) {
     for (const selector of selectors) {
       const text = $el.find(selector).first().text().trim();
-      if (text && text.length > 2) {
-        return text;
-      }
+      if (text && text.length > 2) return text;
       
-      // Check for title attribute
       const title = $el.find(selector).first().attr('title');
-      if (title && title.length > 2) {
-        return title;
-      }
+      if (title && title.length > 2) return title;
     }
     return '';
   }
@@ -162,9 +160,7 @@ class HomeImmoScraper {
       const match = text.match(pattern);
       if (match) {
         const price = parseInt(match[0].replace(/[^\d]/g, ''));
-        if (price > 50 && price < 20000) {
-          return price;
-        }
+        if (price > 50 && price < 20000) return price;
       }
     }
 
@@ -180,23 +176,21 @@ class HomeImmoScraper {
         const priceStr = match[0].replace(/[^\d]/g, '');
         const price = parseInt(priceStr);
         
-        if (price > 1000000) { // Reasonable IDR amount
-          return Math.round(price / 15000); // Convert to USD
+        if (price > 1000000) {
+          return Math.round(price / 15000);
         }
       }
     }
 
-    // Generic number extraction as fallback
+    // Generic number extraction
     const numberMatch = text.match(/(\d{3,7})/);
     if (numberMatch) {
       const num = parseInt(numberMatch[1]);
       
-      // If it looks like IDR (large number)
       if (num > 500000) {
         return Math.round(num / 15000);
       }
       
-      // If it looks like USD
       if (num >= 100 && num <= 10000) {
         return num;
       }
@@ -217,23 +211,16 @@ class HomeImmoScraper {
       const match = text.match(pattern);
       if (match) {
         const rooms = parseInt(match[0].replace(/\D/g, ''));
-        if (rooms >= 0 && rooms <= 10) {
-          return rooms;
-        }
+        if (rooms >= 0 && rooms <= 10) return rooms;
       }
     }
 
-    // Check for studio
-    if (/studio/gi.test(text)) {
-      return 0;
-    }
-
-    return 1; // Default
+    if (/studio/gi.test(text)) return 0;
+    return 1;
   }
 
   extractFurnished(text) {
     if (!text) return null;
-    
     const lowerText = text.toLowerCase();
     
     if (lowerText.includes('fully furnished') || lowerText.includes('furnished')) {
@@ -250,58 +237,41 @@ class HomeImmoScraper {
   normalizeLocation(location) {
     if (!location) return 'Bali';
     
-    // Clean up location string
     location = location.replace(/[,\-\(\)]/g, ' ').trim();
-    
-    // Extract first meaningful location word
     const words = location.split(' ').filter(word => word.length > 2);
     return words[0] || 'Bali';
   }
 
   normalizeUrl(url) {
     if (!url) return null;
-    
-    if (url.startsWith('http')) {
-      return url;
-    }
-    
-    if (url.startsWith('//')) {
-      return 'https:' + url;
-    }
-    
-    if (url.startsWith('/')) {
-      return 'https://bali-home-immo.com' + url;
-    }
-    
+    if (url.startsWith('http')) return url;
+    if (url.startsWith('//')) return 'https:' + url;
+    if (url.startsWith('/')) return 'https://bali-home-immo.com' + url;
     return 'https://bali-home-immo.com/' + url;
+  }
+
+  extractImages($el, $) {
+    const images = [];
+    $el.find('img').each((i, img) => {
+      const src = $(img).attr('src') || $(img).attr('data-src') || $(img).attr('data-lazy');
+      if (src && this.isValidImage(src)) {
+        images.push(this.normalizeUrl(src));
+      }
+    });
+    return images;
   }
 
   isValidImage(src) {
     if (!src) return false;
-    
-    const invalidPatterns = [
-      'placeholder', 'loading', 'spinner', 'blank',
-      'data:image', 'base64', '1x1', 'pixel'
-    ];
-    
+    const invalidPatterns = ['placeholder', 'loading', 'spinner', 'blank', 'data:image', 'base64'];
     const lowerSrc = src.toLowerCase();
     return !invalidPatterns.some(pattern => lowerSrc.includes(pattern));
   }
 
-  isValidListing(listing) {
-    return listing &&
-           listing.title &&
-           listing.title.length >= 10 &&
-           listing.listing_url &&
-           validator.isValidUrl(listing.listing_url);
-  }
-
   fallbackScraping($) {
     const listings = [];
-    
-    // Look for any links that might contain property information
     $('a').each((i, link) => {
-      if (i > 50) return false; // Limit processing
+      if (i > 50) return false;
       
       const $link = $(link);
       const href = $link.attr('href');
@@ -320,7 +290,8 @@ class HomeImmoScraper {
             description: validator.sanitizeText(text),
             image_urls: [],
             listing_url: this.normalizeUrl(href),
-            source: 'Bali Home Immo'
+            source: 'Bali Home Immo',
+            scraped_at: new Date().toISOString()
           });
         }
       }
@@ -336,41 +307,21 @@ class HomeImmoScraper {
     ];
     
     const lowerText = text.toLowerCase();
-    
     for (const location of locations) {
       if (lowerText.includes(location)) {
         return location.charAt(0).toUpperCase() + location.slice(1);
       }
     }
-    
     return null;
   }
 
-  getSampleData() {
-    return [
-      {
-        title: 'Luxury Villa with Pool - Monthly Rental Available',
-        price: 1500,
-        location: 'Seminyak',
-        rooms: 3,
-        furnished: true,
-        description: 'Beautiful luxury villa with private pool in prime Seminyak location',
-        image_urls: [],
-        listing_url: 'https://bali-home-immo.com/sample-1',
-        source: 'Bali Home Immo'
-      },
-      {
-        title: 'Charming House in Ubud Center',
-        price: 900,
-        location: 'Ubud',
-        rooms: 2,
-        furnished: true,
-        description: 'Traditional Balinese house in the heart of Ubud with garden views',
-        image_urls: [],
-        listing_url: 'https://bali-home-immo.com/sample-2',
-        source: 'Bali Home Immo'
-      }
-    ];
+  deduplicateListings(listings) {
+    const seen = new Set();
+    return listings.filter(listing => {
+      if (seen.has(listing.listing_url)) return false;
+      seen.add(listing.listing_url);
+      return true;
+    });
   }
 }
 
