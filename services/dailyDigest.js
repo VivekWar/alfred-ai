@@ -1,160 +1,186 @@
+const { Telegraf } = require('telegraf');
 const database = require('../bot/utils/database');
 const formatter = require('../bot/utils/formatter');
 const logger = require('../bot/utils/logger');
-const bot = require('../bot/bot');
-const constants = require('../config/constants');
 
 class DailyDigestService {
-  async sendToAllUsers() {
-    try {
-      logger.info('🌅 Starting daily digest process...');
-      
-      const users = await database.getAllActiveUsers();
-      logger.info(`Found ${users.length} active users`);
-      
-      let successCount = 0;
-      let errorCount = 0;
+  constructor() {
+    this.bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+  }
 
-      for (const user of users) {
+  async sendDailyDigests() {
+    try {
+      logger.info('🌅 Starting daily digest service...');
+      
+      const activeUsers = await database.getAllActiveUsers();
+      logger.info(`Found ${activeUsers.length} active users`);
+
+      let digestsSent = 0;
+      const errors = [];
+
+      for (const user of activeUsers) {
         try {
           await this.sendDigestToUser(user);
-          successCount++;
+          digestsSent++;
           
-          // Rate limiting - wait between messages
-          await this.delay(constants.TELEGRAM.RATE_LIMIT_DELAY);
+          // Rate limiting
+          await this.delay(1000);
           
         } catch (error) {
-          errorCount++;
           logger.error(`Failed to send digest to user ${user.telegram_id}:`, error);
+          errors.push({ userId: user.telegram_id, error: error.message });
         }
       }
 
-      logger.info(`Daily digest completed: ${successCount} sent, ${errorCount} failed`);
-      return { successCount, errorCount };
+      logger.info(`✅ Daily digest complete: ${digestsSent} sent, ${errors.length} errors`);
       
+      return {
+        success: true,
+        sent: digestsSent,
+        errors: errors.length,
+        details: errors
+      };
+
     } catch (error) {
-      logger.error('Daily digest service error:', error);
-      throw error;
+      logger.error('Daily digest service failed:', error);
+      return {
+        success: false,
+        error: error.message
+      };
     }
   }
 
   async sendDigestToUser(user) {
+    const preferences = user.user_preferences;
+    if (!preferences) {
+      logger.warn(`User ${user.telegram_id} has no preferences, skipping digest`);
+      return;
+    }
+
+    // Get new listings since last digest (24 hours ago)
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    
+    const newListings = await database.getNewListingsForUser(preferences, yesterday);
+
+    if (newListings.length === 0) {
+      logger.info(`No new listings for user ${user.telegram_id}`);
+      // Optionally send "no new listings" message on certain days
+      return;
+    }
+
+    const digestMessage = formatter.formatDailyDigest(newListings, preferences);
+
     try {
-      // Get user preferences
-      const preferences = await database.getUserPreferences(user.id);
+      await this.bot.telegram.sendMessage(user.telegram_id, digestMessage, {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '🔍 View All Listings', callback_data: 'digest_view_all' },
+              { text: '⚙️ Update Preferences', callback_data: 'digest_preferences' }
+            ]
+          ]
+        }
+      });
+
+      // Log the digest send
+      await database.logInteraction(user.id, null, 'digest_sent');
       
-      if (!preferences) {
-        logger.warn(`No preferences found for user ${user.telegram_id}`);
-        return;
-      }
+      logger.info(`✅ Digest sent to user ${user.telegram_id} with ${newListings.length} listings`);
 
-      // Get filtered listings
-      const listings = await database.getFilteredListings(preferences);
-      
-      if (listings.length === 0) {
-        await this.sendNoListingsMessage(user.telegram_id, preferences);
-        return;
-      }
-
-      // Send digest header
-      await bot.telegram.sendMessage(
-        user.telegram_id,
-        formatter.formatDailyDigestHeader(listings.length),
-        { parse_mode: 'HTML' }
-      );
-
-      // Send top 3 listings
-      const topListings = listings.slice(0, 3);
-      
-      for (let i = 0; i < topListings.length; i++) {
-        const listing = topListings[i];
-        const message = formatter.formatListing(listing, i + 1);
-        
-        await bot.telegram.sendMessage(
-          user.telegram_id,
-          message,
-          { 
-            parse_mode: 'HTML',
-            disable_web_page_preview: false
-          }
-        );
-
-        // Log interaction
-        await database.logInteraction(user.id, listing.id, 'daily_digest_sent');
-        
-        // Small delay between listings
-        await this.delay(500);
-      }
-
-      // Send footer with options
-      if (listings.length > 3) {
-        await bot.telegram.sendMessage(
-          user.telegram_id,
-          `📋 *${listings.length - 3} more listings available*\n\nUse /listings to see all results!`,
-          { parse_mode: 'Markdown' }
-        );
-      }
-
-      logger.info(`Digest sent to user ${user.telegram_id}: ${topListings.length} listings`);
-      
-    } catch (error) {
-      // Handle blocked users or other telegram errors
-      if (error.code === 403) {
-        await database.deactivateUser(user.id);
-        logger.info(`User ${user.telegram_id} blocked the bot - deactivated`);
+    } catch (telegramError) {
+      if (telegramError.code === 403) {
+        // User blocked the bot, deactivate them
+        logger.warn(`User ${user.telegram_id} blocked the bot, deactivating`);
+        await this.deactivateUser(user.id);
       } else {
-        throw error;
+        throw telegramError;
       }
     }
   }
 
-  async sendNoListingsMessage(telegramId, preferences) {
-    const message = `🌅 *Good morning!*\n\n` +
-      `🔍 No new listings matching your preferences today, but don't worry!\n\n` +
-      `I'm continuously searching for:\n` +
-      `📍 Location: ${preferences.location || 'Any location'}\n` +
-      (preferences.max_budget ? `💰 Budget: Up to $${preferences.max_budget}/month\n` : '') +
-      (preferences.min_rooms !== null ? `🛏️ Rooms: ${preferences.min_rooms}+ minimum\n` : '') +
-      `\n💡 *Tip*: You can adjust your preferences anytime with /start\n\n` +
-      `I'll keep searching and update you tomorrow! 🏠`;
-
-    await bot.telegram.sendMessage(telegramId, message, {
-      parse_mode: 'Markdown'
-    });
-  }
-
-  async sendWeeklyStats() {
+  async deactivateUser(userId) {
     try {
-      logger.info('📊 Sending weekly stats...');
-      
-      const users = await database.getAllActiveUsers();
-      const stats = await database.getWeeklyStats();
-      
-      for (const user of users) {
-        try {
-          const userStats = await database.getUserStats(user.id);
-          const message = formatter.formatWeeklyStats(stats, userStats);
-          
-          await bot.telegram.sendMessage(user.telegram_id, message, {
-            parse_mode: 'Markdown'
-          });
-          
-          await this.delay(constants.TELEGRAM.RATE_LIMIT_DELAY);
-          
-        } catch (error) {
-          logger.error(`Failed to send weekly stats to user ${user.telegram_id}:`, error);
-        }
-      }
-      
-      logger.info('Weekly stats sending completed');
-      
+      await database.deactivateUser(userId);
+      logger.info(`Deactivated user ${userId}`);
     } catch (error) {
-      logger.error('Weekly stats service error:', error);
+      logger.error(`Failed to deactivate user ${userId}:`, error);
     }
   }
 
   delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  async sendWeeklyStats() {
+    try {
+      logger.info('📊 Generating weekly stats...');
+      
+      const stats = await database.getWeeklyStats();
+      const activeUsers = await database.getAllActiveUsers();
+
+      const statsMessage = `
+📊 <b>Weekly Alfred AI Stats</b>
+
+👥 <b>Active Users:</b> ${activeUsers.length}
+🏠 <b>New Listings:</b> ${stats.total_listings}
+
+<b>By Source:</b>
+${Object.entries(stats.by_source)
+  .map(([source, count]) => `• ${source}: ${count}`)
+  .join('\n')}
+
+<b>Week of:</b> ${stats.week_start.toLocaleDateString()}
+      `;
+
+      // Send to admin users (you can define admin telegram IDs)
+      const adminIds = process.env.ADMIN_TELEGRAM_IDS?.split(',') || [];
+      
+      for (const adminId of adminIds) {
+        try {
+          await this.bot.telegram.sendMessage(parseInt(adminId), statsMessage, {
+            parse_mode: 'HTML'
+          });
+        } catch (error) {
+          logger.error(`Failed to send stats to admin ${adminId}:`, error);
+        }
+      }
+
+      logger.info('✅ Weekly stats sent to admins');
+
+    } catch (error) {
+      logger.error('Weekly stats failed:', error);
+    }
+  }
+}
+
+// Run if called directly
+if (require.main === module) {
+  const service = new DailyDigestService();
+  
+  const action = process.argv[2] || 'digest';
+  
+  if (action === 'digest') {
+    service.sendDailyDigests()
+      .then(result => {
+        console.log('Daily digest result:', result);
+        process.exit(result.success ? 0 : 1);
+      })
+      .catch(error => {
+        console.error('Daily digest error:', error);
+        process.exit(1);
+      });
+  } else if (action === 'stats') {
+    service.sendWeeklyStats()
+      .then(() => {
+        console.log('Weekly stats sent');
+        process.exit(0);
+      })
+      .catch(error => {
+        console.error('Weekly stats error:', error);
+        process.exit(1);
+      });
   }
 }
 

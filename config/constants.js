@@ -1,81 +1,53 @@
 module.exports = {
-  // Bot configuration
   BOT: {
     COMMANDS: {
       START: 'start',
       LISTINGS: 'listings',
       PREFERENCES: 'preferences',
-      HELP: 'help',
-      STATS: 'stats'
+      HELP: 'help'
     },
-    
-    MESSAGES: {
-      WELCOME: '🏠 Welcome to Alfred.ai! Your personal Bali rental assistant.',
-      ERROR_GENERIC: '❌ Something went wrong. Please try again later.',
-      NO_LISTINGS: '🔍 No listings found matching your preferences today.',
-      PREFERENCES_SAVED: '✅ Your preferences have been saved!',
-      SCRAPING_START: '🔍 Searching for new listings...',
-      SCRAPING_COMPLETE: '✅ Found new listings for you!'
+    STATES: {
+      ONBOARDING_LOCATION: 'onboarding_location',
+      ONBOARDING_BUDGET: 'onboarding_budget',
+      ONBOARDING_ROOMS: 'onboarding_rooms',
+      ONBOARDING_DURATION: 'onboarding_duration',
+      COMPLETE: 'complete'
     }
   },
-
-  // Scraping configuration
+  
+  LOCATIONS: [
+    'Canggu', 'Seminyak', 'Ubud', 'Sanur', 'Kuta',
+    'Legian', 'Jimbaran', 'Nusa Dua', 'Uluwatu', 'Berawa'
+  ],
+  
+  BUDGETS: [
+    { text: 'Under $500', value: 500 },
+    { text: '$500 - $1000', value: 1000 },
+    { text: '$1000 - $2000', value: 2000 },
+    { text: '$2000 - $5000', value: 5000 },
+    { text: 'Above $5000', value: 10000 }
+  ],
+  
+  ROOMS: [
+    { text: 'Studio', value: 0 },
+    { text: '1 Bedroom', value: 1 },
+    { text: '2 Bedrooms', value: 2 },
+    { text: '3+ Bedrooms', value: 3 }
+  ],
+  
+  DURATIONS: [
+    'Short term (1-3 months)',
+    'Medium term (3-6 months)', 
+    'Long term (6+ months)',
+    'Flexible'
+  ],
+  
   SCRAPING: {
-    MAX_LISTINGS_PER_SOURCE: 20,
-    TIMEOUT: 15000,
-    USER_AGENT: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    
-    SOURCES: {
-      FACEBOOK_MARKETPLACE: 'Facebook Marketplace',
-      FACEBOOK_GROUPS: 'Facebook Groups',
-      RUMAH_KOST: 'Rumah Kost Bali',
-      VILLA_HUB: 'Bali Villa Hub',
-      HOME_IMMO: 'Bali Home Immo',
-      RENT_ROOM_BALI: 'RentRoomBali'
-    },
-
-    RETRY_ATTEMPTS: 3,
-    RETRY_DELAY: 2000
-  },
-
-  // Location mappings
-  LOCATIONS: {
-    POPULAR: [
-      'Canggu', 'Seminyak', 'Ubud', 'Sanur', 'Denpasar',
-      'Kuta', 'Legian', 'Jimbaran', 'Nusa Dua', 'Uluwatu'
-    ],
-    
-    ALIASES: {
-      'echo beach': 'Canggu',
-      'batu bolong': 'Canggu',
-      'berawa': 'Canggu',
-      'pererenan': 'Canggu',
-      'petitenget': 'Seminyak',
-      'monkey forest': 'Ubud',
-      'central ubud': 'Ubud'
-    }
-  },
-
-  // Price ranges (USD)
-  PRICE_RANGES: {
-    BUDGET: { min: 0, max: 500 },
-    MID_RANGE: { min: 500, max: 1200 },
-    LUXURY: { min: 1200, max: 5000 },
-    ULTRA_LUXURY: { min: 5000, max: 50000 }
-  },
-
-  // Database configuration
-  DATABASE: {
-    BATCH_SIZE: 50,
-    MAX_LISTING_AGE_DAYS: 30,
-    CLEANUP_INTERVAL_HOURS: 24
-  },
-
-  // Telegram limits
-  TELEGRAM: {
-    MAX_MESSAGE_LENGTH: 4096,
-    MAX_CAPTION_LENGTH: 1024,
-    MAX_KEYBOARD_BUTTONS: 100,
-    RATE_LIMIT_DELAY: 1000
+    MAX_LISTINGS_PER_SOURCE: 50,
+    TIMEOUT: 30000,
+    USER_AGENTS: [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    ]
   }
 };

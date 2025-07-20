@@ -1,89 +1,20 @@
 class Validator {
-  validateTelegramId(id) {
-    return typeof id === 'number' && id > 0;
-  }
-
-  validateLocation(location) {
-    if (!location || typeof location !== 'string') return false;
-    return location.trim().length > 0 && location.trim().length <= 100;
-  }
-
-  validateBudget(budget) {
-    if (budget === null || budget === undefined) return true; // No budget is valid
-    return typeof budget === 'number' && budget > 0 && budget <= 50000;
-  }
-
-  validateRooms(rooms) {
-    if (rooms === null || rooms === undefined) return true; // Any rooms is valid
-    return typeof rooms === 'number' && rooms >= 0 && rooms <= 10;
-  }
-
-  validateDuration(duration) {
-    if (!duration) return true; // No duration is valid
-    const validDurations = [
-      '1 Month', '2-3 Months', '3-6 Months', 
-      '6-12 Months', '1+ Year', 'Flexible'
-    ];
-    return validDurations.includes(duration) || duration.length <= 50;
-  }
-
-  validateFurnishedPreference(preference) {
-    if (!preference) return true;
-    return ['furnished', 'unfurnished'].includes(preference);
-  }
-
-  validatePreferences(preferences) {
-    const errors = [];
-
-    if (preferences.location && !this.validateLocation(preferences.location)) {
-      errors.push('Invalid location');
-    }
-
-    if (!this.validateBudget(preferences.max_budget)) {
-      errors.push('Invalid budget amount');
-    }
-
-    if (!this.validateRooms(preferences.min_rooms)) {
-      errors.push('Invalid room count');
-    }
-
-    if (!this.validateDuration(preferences.rental_duration)) {
-      errors.push('Invalid rental duration');
-    }
-
-    if (!this.validateFurnishedPreference(preferences.furnished_preference)) {
-      errors.push('Invalid furnished preference');
-    }
-
-    return {
-      valid: errors.length === 0,
-      errors
-    };
-  }
-
-  validateListingData(listing) {
-    const errors = [];
-
-    if (!listing.title || listing.title.length < 5) {
-      errors.push('Title too short');
-    }
-
-    if (listing.price && (listing.price < 0 || listing.price > 100000)) {
-      errors.push('Invalid price range');
-    }
-
-    if (!listing.listing_url || !this.isValidUrl(listing.listing_url)) {
-      errors.push('Invalid listing URL');
-    }
-
-    if (!listing.source || listing.source.length === 0) {
-      errors.push('Source is required');
-    }
-
-    return {
-      valid: errors.length === 0,
-      errors
-    };
+  sanitizeText(text) {
+    if (!text || typeof text !== 'string') return '';
+    
+    return text
+      .replace(/[<>&"']/g, (match) => {
+        const map = {
+          '<': '&lt;',
+          '>': '&gt;',
+          '&': '&amp;',
+          '"': '&quot;',
+          "'": '&#39;'
+        };
+        return map[match];
+      })
+      .trim()
+      .substring(0, 2000); // Telegram message limit
   }
 
   isValidUrl(url) {
@@ -95,25 +26,90 @@ class Validator {
     }
   }
 
-  sanitizeText(text) {
-    if (!text) return '';
-    return text.toString()
-      .replace(/<[^>]*>/g, '') // Remove HTML tags
-      .replace(/[^\w\s\-_.,$%/]/g, '') // Keep only safe characters
-      .trim()
-      .substring(0, 1000); // Limit length
+  isValidPrice(price) {
+    return typeof price === 'number' && price > 0 && price < 100000;
   }
 
-  sanitizePrice(price) {
-    if (!price) return null;
-    const numPrice = parseFloat(price.toString().replace(/[^\d.]/g, ''));
-    return isNaN(numPrice) ? null : Math.max(0, Math.min(numPrice, 100000));
+  isValidTelegramId(id) {
+    return typeof id === 'number' && id > 0;
   }
 
-  extractNumericValue(text, defaultValue = null) {
-    if (!text) return defaultValue;
-    const match = text.toString().match(/(\d+)/);
-    return match ? parseInt(match[1]) : defaultValue;
+  isValidRooms(rooms) {
+    return typeof rooms === 'number' && rooms >= 0 && rooms <= 10;
+  }
+
+  validateListing(listing) {
+    const errors = [];
+    
+    if (!listing.title || typeof listing.title !== 'string' || listing.title.length < 5) {
+      errors.push('Title must be at least 5 characters');
+    }
+    
+    if (!listing.listing_url || !this.isValidUrl(listing.listing_url)) {
+      errors.push('Valid listing URL is required');
+    }
+    
+    if (listing.price !== null && listing.price !== undefined && !this.isValidPrice(listing.price)) {
+      errors.push('Price must be a positive number less than 100,000');
+    }
+    
+    if (listing.rooms !== null && listing.rooms !== undefined && !this.isValidRooms(listing.rooms)) {
+      errors.push('Rooms must be between 0 and 10');
+    }
+    
+    if (!listing.source || typeof listing.source !== 'string') {
+      errors.push('Source is required');
+    }
+    
+    return {
+      isValid: errors.length === 0,
+      errors
+    };
+  }
+
+  validateUserPreferences(preferences) {
+    const errors = [];
+    
+    if (preferences.max_budget !== null && preferences.max_budget !== undefined) {
+      if (typeof preferences.max_budget !== 'number' || preferences.max_budget <= 0) {
+        errors.push('Budget must be a positive number');
+      }
+    }
+    
+    if (preferences.min_rooms !== null && preferences.min_rooms !== undefined) {
+      if (!this.isValidRooms(preferences.min_rooms)) {
+        errors.push('Rooms must be between 0 and 10');
+      }
+    }
+    
+    return {
+      isValid: errors.length === 0,
+      errors
+    };
+  }
+
+  cleanPhoneNumber(phone) {
+    if (!phone) return null;
+    return phone.replace(/[^\d+]/g, '');
+  }
+
+  extractPrice(text) {
+    if (!text) return null;
+    
+    // USD patterns
+    const usdMatch = text.match(/\$\s?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/);
+    if (usdMatch) {
+      return parseInt(usdMatch[1].replace(/,/g, ''));
+    }
+    
+    // IDR patterns and conversion
+    const idrMatch = text.match(/(?:Rp|IDR)\s?(\d{1,3}(?:[.,]\d{3})*)/i);
+    if (idrMatch) {
+      const idrAmount = parseInt(idrMatch[1].replace(/[.,]/g, ''));
+      return Math.round(idrAmount / 15000); // Convert to USD
+    }
+    
+    return null;
   }
 }
 

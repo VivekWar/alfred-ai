@@ -2,295 +2,239 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const validator = require('../bot/utils/validator');
 const logger = require('../bot/utils/logger');
+const { SCRAPING } = require('../config/constants');
 
 class VillaHubScraper {
   async scrape() {
     try {
-      logger.info('Starting VillaHub scraping...');
+      logger.info('Starting Villa Hub scraping...');
       
-      const response = await axios.get(
-        'https://www.balivillahub.com/en/category/room-for-monthly-rent',
-        {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-          },
-          timeout: 15000
-        }
-      );
+      const response = await axios.get('https://www.villahubbali.com/monthly-rentals', {
+        headers: {
+          'User-Agent': SCRAPING.USER_AGENTS[0],
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.5',
+          'Accept-Encoding': 'gzip, deflate, br',
+        },
+        timeout: SCRAPING.TIMEOUT
+      });
 
       const $ = cheerio.load(response.data);
       const listings = [];
 
-      // Common selectors for property listing sites
-      const selectors = [
+      const propertySelectors = [
         '.property-item',
-        '.listing-card',
+        '.villa-card',
+        '.listing-item',
         '.property-card',
-        '.villa-item',
-        '.rental-item',
-        '[class*="property"]',
-        '[class*="listing"]'
+        '[data-property-id]'
       ];
 
-      let foundListings = false;
+      let foundItems = false;
 
-      for (const selector of selectors) {
+      for (const selector of propertySelectors) {
         const items = $(selector);
         if (items.length > 0) {
-          foundListings = true;
+          foundItems = true;
           logger.info(`Found ${items.length} items with selector: ${selector}`);
 
           items.each((i, element) => {
+            if (i >= SCRAPING.MAX_LISTINGS_PER_SOURCE) return false;
+            
             try {
               const $el = $(element);
+              const listing = this.extractListingData($el, $);
               
-              const title = this.extractTitle($el);
-              const price = this.extractPrice($el);
-              const location = this.extractLocation($el);
-              const link = this.extractLink($el);
-              const images = this.extractImages($el);
-              const description = this.extractDescription($el);
-
-              if (title && link) {
-                const listing = {
-                  title: validator.sanitizeText(title),
-                  price: validator.sanitizePrice(price),
-                  location: location || 'Bali',
-                  rooms: this.extractRooms(title + ' ' + description),
-                  furnished: this.extractFurnished(title + ' ' + description),
-                  description: validator.sanitizeText(description),
-                  image_urls: images,
-                  listing_url: this.normalizeUrl(link),
-                  source: 'Bali Villa Hub'
-                };
-
-                const validation = validator.validateListingData(listing);
-                if (validation.valid) {
-                  listings.push(listing);
-                }
+              if (listing && validator.validateListing(listing).isValid) {
+                listings.push(listing);
               }
             } catch (error) {
-              logger.warn('Error parsing villa hub listing:', error);
+              logger.warn(`Error extracting listing ${i}:`, error.message);
             }
           });
-          break; // Use first working selector
+          
+          break;
         }
       }
 
-      if (!foundListings) {
-        // Fallback: try to find any links that might be property listings
-        const fallbackListings = this.fallbackExtraction($);
+      if (!foundItems) {
+        logger.warn('No structured listings found, trying fallback method');
+        const fallbackListings = this.fallbackScraping($);
         listings.push(...fallbackListings);
       }
 
-      logger.info(`VillaHub scraped ${listings.length} listings`);
-      return listings.slice(0, 20);
+      const uniqueListings = this.deduplicateListings(listings);
+      logger.info(`Villa Hub scraped ${uniqueListings.length} unique listings`);
+      
+      return uniqueListings;
 
     } catch (error) {
-      logger.error('VillaHub scraping error:', error);
-      
-      // Return mock data for development if scraping fails
-      if (process.env.NODE_ENV === 'development') {
-        return this.getMockData();
-      }
-      
+      logger.error('Villa Hub scraping error:', error);
       return [];
     }
   }
 
-  extractTitle($el) {
-    const titleSelectors = ['h2', 'h3', '.title', '.property-title', '.listing-title', 'a[title]'];
+  extractListingData($el, $) {
+    const title = this.extractText($el, [
+      'h1', 'h2', 'h3', '.title', '.property-title', '.villa-title'
+    ]);
+
+    const priceText = this.extractText($el, [
+      '.price', '.cost', '.rent', '.monthly-price', '[class*="price"]'
+    ]);
     
-    for (const selector of titleSelectors) {
-      const title = $el.find(selector).first().text().trim() || $el.find(selector).first().attr('title');
-      if (title && title.length > 5) {
-        return title;
-      }
-    }
-    
-    return $el.find('a').first().text().trim();
+    const price = validator.extractPrice(priceText || $el.text());
+
+    const location = this.extractText($el, [
+      '.location', '.area', '.address', '[class*="location"]'
+    ]) || this.extractLocationFromText($el.text());
+
+    const description = this.extractText($el, [
+      '.description', '.details', '.summary', 'p'
+    ]);
+
+    const link = $el.find('a').first().attr('href') || 
+                 $el.closest('a').attr('href');
+
+    const images = this.extractImages($el, $);
+
+    if (!title || !link) return null;
+
+    return {
+      title: validator.sanitizeText(title),
+      price: price,
+      location: location || 'Bali',
+      rooms: this.extractRooms(title + ' ' + description),
+      furnished: this.extractFurnished(title + ' ' + description),
+      description: validator.sanitizeText(description || title),
+      image_urls: images,
+      listing_url: this.normalizeUrl(link),
+      source: 'Villa Hub Bali',
+      scraped_at: new Date().toISOString()
+    };
   }
 
-  extractPrice($el) {
-    const priceSelectors = ['.price', '.cost', '.rent', '.amount', '[class*="price"]'];
-    
-    for (const selector of priceSelectors) {
-      const priceText = $el.find(selector).text().trim();
-      if (priceText) {
-        return this.parsePrice(priceText);
-      }
+  extractText($el, selectors) {
+    for (const selector of selectors) {
+      const text = $el.find(selector).first().text().trim();
+      if (text && text.length > 2) return text;
     }
-    
-    // Search in all text for price patterns
-    const allText = $el.text();
-    return this.parsePrice(allText);
+    return null;
   }
 
-  extractLocation($el) {
-    const locationSelectors = ['.location', '.area', '.address', '[class*="location"]'];
-    
-    for (const selector of locationSelectors) {
-      const location = $el.find(selector).text().trim();
-      if (location) {
-        return this.normalizeLocation(location);
-      }
-    }
-    
-    // Look for location in title or description
-    const allText = $el.text().toLowerCase();
-    const baliAreas = ['canggu', 'seminyak', 'ubud', 'sanur', 'denpasar', 'kuta', 'legian', 'jimbaran', 'uluwatu'];
-    
-    for (const area of baliAreas) {
-      if (allText.includes(area)) {
-        return area.charAt(0).toUpperCase() + area.slice(1);
-      }
-    }
-    
-    return 'Bali';
-  }
-
-  extractLink($el) {
-    const link = $el.find('a').first().attr('href');
-    return link ? this.normalizeUrl(link) : null;
-  }
-
-  extractImages($el) {
+  extractImages($el, $) {
     const images = [];
     $el.find('img').each((i, img) => {
-      const src = $(img).attr('src') || $(img).attr('data-src');
-      if (src && !src.includes('placeholder') && !src.includes('loading')) {
+      if (i >= 3) return false; // Max 3 images
+      
+      const $img = $(img);
+      const src = $img.attr('src') || $img.attr('data-src') || $img.attr('data-lazy-src');
+      
+      if (src && this.isValidImage(src)) {
         images.push(this.normalizeUrl(src));
       }
     });
-    return images.slice(0, 3);
-  }
-
-  extractDescription($el) {
-    const descSelectors = ['.description', '.details', '.summary', '.excerpt'];
-    
-    for (const selector of descSelectors) {
-      const desc = $el.find(selector).text().trim();
-      if (desc && desc.length > 20) {
-        return desc;
-      }
-    }
-    
-    return $el.text().trim().substring(0, 300);
-  }
-
-  parsePrice(text) {
-    // Look for USD prices
-    const usdMatch = text.match(/\$\s*[\d,]+/);
-    if (usdMatch) {
-      return parseInt(usdMatch[0].replace(/[^\d]/g, ''));
-    }
-    
-    // Look for IDR prices and convert
-    const idrMatch = text.match(/(?:rp|idr)\s*[\d.,]+(?:\s*(?:juta|jt|million))?/i);
-    if (idrMatch) {
-      const amount = parseInt(idrMatch[0].replace(/[^\d]/g, ''));
-      const isJuta = /juta|jt|million/i.test(idrMatch[0]);
-      const finalAmount = isJuta ? amount * 1000000 : amount;
-      return Math.round(finalAmount / 15000); // Convert IDR to USD
-    }
-    
-    // Generic number extraction
-    const numberMatch = text.match(/[\d,]+/);
-    if (numberMatch) {
-      const num = parseInt(numberMatch[0].replace(/,/g, ''));
-      // If number is very large, assume IDR
-      if (num > 1000000) {
-        return Math.round(num / 15000);
-      }
-      // If reasonable USD amount
-      if (num > 100 && num < 10000) {
-        return num;
-      }
-    }
-    
-    return null;
+    return images;
   }
 
   extractRooms(text) {
-    const roomMatch = text.match(/(\d+)\s*(?:bed|bedroom|room|br|kamar)/i);
-    return roomMatch ? parseInt(roomMatch[1]) : 1;
+    if (!text) return 1;
+    
+    if (/studio/i.test(text)) return 0;
+    
+    const roomPatterns = [
+      /(\d+)\s*(?:bedroom|bed|room|br)/i,
+      /(?:bedroom|bed|room|br)\s*(\d+)/i
+    ];
+
+    for (const pattern of roomPatterns) {
+      const match = text.match(pattern);
+      if (match) {
+        const rooms = parseInt(match[1] || match[2]);
+        if (rooms >= 0 && rooms <= 10) return rooms;
+      }
+    }
+    
+    return 1;
   }
 
   extractFurnished(text) {
+    if (!text) return null;
     const lowerText = text.toLowerCase();
-    if (lowerText.includes('furnished') || lowerText.includes('lengkap')) return true;
-    if (lowerText.includes('unfurnished') || lowerText.includes('kosong')) return false;
+    
+    if (lowerText.includes('fully furnished') || lowerText.includes('furnished')) {
+      return true;
+    }
+    if (lowerText.includes('unfurnished')) {
+      return false;
+    }
     return null;
+  }
+
+  extractLocationFromText(text) {
+    const locations = [
+      'canggu', 'seminyak', 'ubud', 'sanur', 'denpasar',
+      'kuta', 'legian', 'jimbaran', 'nusa dua', 'uluwatu'
+    ];
+    
+    const lowerText = text.toLowerCase();
+    for (const location of locations) {
+      if (lowerText.includes(location)) {
+        return location.charAt(0).toUpperCase() + location.slice(1);
+      }
+    }
+    return 'Bali';
   }
 
   normalizeUrl(url) {
     if (!url) return null;
     if (url.startsWith('http')) return url;
     if (url.startsWith('//')) return 'https:' + url;
-    return 'https://www.balivillahub.com' + (url.startsWith('/') ? '' : '/') + url;
+    if (url.startsWith('/')) return 'https://www.villahubbali.com' + url;
+    return 'https://www.villahubbali.com/' + url;
   }
 
-  normalizeLocation(location) {
-    return location.replace(/[,\-]/g, ' ').split(' ')[0];
+  isValidImage(src) {
+    if (!src || src.includes('data:image')) return false;
+    const invalidPatterns = ['placeholder', 'loading', 'spinner', 'blank'];
+    return !invalidPatterns.some(pattern => src.toLowerCase().includes(pattern));
   }
 
-  fallbackExtraction($) {
+  fallbackScraping($) {
     const listings = [];
-    
-    // Look for any links that might contain rental information
     $('a').each((i, link) => {
-      const $link = $(link);
-      const text = $link.text().toLowerCase();
-      const href = $link.attr('href');
+      if (i > 20) return false;
       
-      if (href && (text.includes('villa') || text.includes('rent') || text.includes('room'))) {
+      const $link = $(link);
+      const href = $link.attr('href');
+      const text = $link.text().trim();
+      
+      if (href && text.length > 10 && /villa|house|rental/i.test(text)) {
         listings.push({
-          title: validator.sanitizeText($link.text() || 'Villa Rental'),
-          price: null,
-          location: 'Bali',
-          rooms: 1,
-          furnished: null,
-          description: validator.sanitizeText($link.text()),
+          title: validator.sanitizeText(text.substring(0, 100)),
+          price: validator.extractPrice(text),
+          location: this.extractLocationFromText(text),
+          rooms: this.extractRooms(text),
+          furnished: this.extractFurnished(text),
+          description: validator.sanitizeText(text),
           image_urls: [],
           listing_url: this.normalizeUrl(href),
-          source: 'Bali Villa Hub'
+          source: 'Villa Hub Bali',
+          scraped_at: new Date().toISOString()
         });
       }
     });
-    
-    return listings.slice(0, 5);
+    return listings.slice(0, 10);
   }
 
-  getMockData() {
-    return [
-      {
-        title: 'Modern Villa in Canggu - Monthly Rental',
-        price: 1200,
-        location: 'Canggu',
-        rooms: 2,
-        furnished: true,
-        description: 'Beautiful modern villa with pool and garden, perfect for monthly stays',
-        image_urls: [],
-        listing_url: 'https://www.balivillahub.com/sample-listing-1',
-        source: 'Bali Villa Hub'
-      },
-      {
-        title: 'Cozy Studio in Seminyak',
-        price: 800,
-        location: 'Seminyak',
-        rooms: 1,
-        furnished: true,
-        description: 'Fully furnished studio apartment in central Seminyak location',
-        image_urls: [],
-        listing_url: 'https://www.balivillahub.com/sample-listing-2',
-        source: 'Bali Villa Hub'
-      }
-    ];
+  deduplicateListings(listings) {
+    const seen = new Set();
+    return listings.filter(listing => {
+      const url = listing.listing_url;
+      if (seen.has(url)) return false;
+      seen.add(url);
+      return true;
+    });
   }
 }
 

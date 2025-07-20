@@ -1,136 +1,145 @@
 const database = require('../utils/database');
 const formatter = require('../utils/formatter');
 const logger = require('../utils/logger');
-const { Markup } = require('telegraf');
 
 class ListingsHandler {
-  async handle(ctx) {
+  async showListings(ctx) {
     try {
-      const user = await database.getUserByTelegramId(ctx.from.id);
+      const user = ctx.from;
+      let dbUser = await database.getUserByTelegramId(user.id);
       
-      if (!user) {
-        return ctx.reply(
-          '👋 Welcome! Please start with /start to set your preferences first.',
-          Markup.keyboard([['🚀 Get Started']]).resize().reply_markup
-        );
+      if (!dbUser) {
+        return ctx.reply('👋 Please start with /start to set up your preferences first!');
       }
 
-      // Get user preferences
-      const preferences = await database.getUserPreferences(user.id);
+      const preferences = await database.getUserPreferences(dbUser.id);
       
       if (!preferences) {
-        return ctx.reply(
-          '⚙️ Please set your preferences first using /start',
-          Markup.keyboard([['🚀 Get Started']]).resize().reply_markup
-        );
+        return ctx.reply('🎯 Please set up your preferences first using /start');
       }
 
-      await ctx.reply('🔍 Searching for listings that match your preferences...');
+      await ctx.reply('🔍 Searching for properties that match your criteria...');
 
-      // Get filtered listings
       const listings = await database.getFilteredListings(preferences);
-      
-      if (listings.length === 0) {
-        const noListingsMsg = `🔍 *No listings found today*\n\n` +
-          `Don't worry! I'm constantly scraping new properties. ` +
-          `You'll get fresh listings in tomorrow's morning digest.\n\n` +
-          `💡 *Tip*: Try adjusting your preferences with /start if you want to see more options.`;
-        
-        return ctx.reply(noListingsMsg, {
-          parse_mode: 'Markdown',
-          reply_markup: Markup.keyboard([
-            ['⚙️ Edit Preferences', '📊 My Stats']
-          ]).resize().reply_markup
-        });
+
+      if (!listings || listings.length === 0) {
+        return ctx.reply(`
+😔 <b>No properties found matching your criteria</b>
+
+Try adjusting your preferences with /preferences or check back later for new listings!
+
+Current criteria:
+📍 Location: ${preferences.location || 'Any'}
+💰 Budget: Up to $${preferences.max_budget || 'No limit'}/month
+🛏️ Min bedrooms: ${preferences.min_rooms || 'Any'}
+        `, { parse_mode: 'HTML' });
       }
 
-      // Send header message
-      await ctx.reply(
-        `🏠 *Found ${listings.length} listing${listings.length > 1 ? 's' : ''} for you:*\n` +
-        `Here are the top ${Math.min(3, listings.length)}:`,
-        { parse_mode: 'Markdown' }
-      );
+      // Log interaction
+      await database.logInteraction(dbUser.id, null, 'searched_listings');
 
-      // Send top 3 listings
-      const topListings = listings.slice(0, 3);
+      // Send listings one by one
+      for (const listing of listings.slice(0, 10)) {
+        await this.sendListing(ctx, listing, dbUser.id);
+        await this.delay(1000); // Avoid rate limiting
+      }
+
+      await ctx.reply(`
+📊 <b>Search Complete!</b>
+
+Found ${listings.length} properties matching your criteria.
+${listings.length > 10 ? 'Showing first 10 results.' : ''}
+
+💡 <b>Tip:</b> Use /preferences to adjust your search criteria.
+      `, { parse_mode: 'HTML' });
+
+    } catch (error) {
+      logger.error('Listings handler error:', error);
+      await ctx.reply('❌ Error fetching listings. Please try again.');
+    }
+  }
+
+  async sendListing(ctx, listing, userId) {
+    try {
+      const message = formatter.formatListing(listing);
       
-      for (let i = 0; i < topListings.length; i++) {
-        const listing = topListings[i];
-        const message = formatter.formatListing(listing, i + 1);
-        
-        // Add action buttons for each listing
-        const buttons = Markup.inlineKeyboard([
+      const keyboard = {
+        inline_keyboard: [
           [
-            Markup.button.url('🔗 View Details', listing.listing_url),
-            Markup.button.callback('❤️ Save', `save_${listing.id}`)
+            { text: '❤️ Save', callback_data: `listing_save_${listing.id}` },
+            { text: '👁️ View Details', callback_data: `listing_view_${listing.id}` },
+            { text: '❌ Hide', callback_data: `listing_hide_${listing.id}` }
           ],
-          [Markup.button.callback('👎 Not Interested', `hide_${listing.id}`)]
-        ]);
+          [
+            { text: '🔗 Open Link', url: listing.listing_url }
+          ]
+        ]
+      };
 
+      // Send with image if available
+      if (listing.image_urls && listing.image_urls.length > 0) {
+        try {
+          await ctx.replyWithPhoto(listing.image_urls[0], {
+            caption: message,
+            parse_mode: 'HTML',
+            reply_markup: keyboard
+          });
+        } catch (imageError) {
+          // Fallback to text message if image fails
+          await ctx.reply(message, {
+            parse_mode: 'HTML',
+            reply_markup: keyboard
+          });
+        }
+      } else {
         await ctx.reply(message, {
           parse_mode: 'HTML',
-          reply_markup: buttons.reply_markup,
-          disable_web_page_preview: false
+          reply_markup: keyboard
         });
+      }
 
-        // Log user interaction
-        await database.logInteraction(user.id, listing.id, 'viewed');
+      // Log view interaction
+      await database.logInteraction(userId, listing.id, 'viewed');
+
+    } catch (error) {
+      logger.error('Send listing error:', error);
+    }
+  }
+
+  async handleListingCallback(ctx) {
+    try {
+      const data = ctx.callbackQuery.data;
+      const [, action, listingId] = data.split('_');
+      
+      await ctx.answerCbQuery();
+
+      const user = await database.getUserByTelegramId(ctx.from.id);
+      if (!user) return;
+
+      switch (action) {
+        case 'save':
+          await database.logInteraction(user.id, listingId, 'saved');
+          await ctx.answerCbQuery('❤️ Saved to your favorites!');
+          break;
         
-        // Small delay between messages
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        case 'view':
+          await database.logInteraction(user.id, listingId, 'viewed_details');
+          await ctx.answerCbQuery('👁️ Viewing details...');
+          break;
+        
+        case 'hide':
+          await database.logInteraction(user.id, listingId, 'hidden');
+          await ctx.answerCbQuery('❌ Property hidden');
+          // Could also edit the message to show it's hidden
+          break;
       }
-
-      // Show more options if there are additional listings
-      if (listings.length > 3) {
-        await ctx.reply(
-          `📋 *${listings.length - 3} more listings available*\n` +
-          `Use the buttons below to see more or adjust your preferences.`,
-          {
-            parse_mode: 'Markdown',
-            reply_markup: Markup.keyboard([
-              ['📋 Show More', '⚙️ Edit Preferences'],
-              ['📊 My Stats', 'ℹ️ Help']
-            ]).resize().reply_markup
-          }
-        );
-      }
-
-      logger.info(`Sent ${topListings.length} listings to user ${user.id}`);
-
     } catch (error) {
-      logger.error('Listings handler error', error);
-      await ctx.reply('❌ Error fetching listings. Please try again later.');
+      logger.error('Listing callback error:', error);
     }
   }
 
-  async handleSave(ctx) {
-    try {
-      const listingId = ctx.match[1];
-      const user = await database.getUserByTelegramId(ctx.from.id);
-      
-      await database.logInteraction(user.id, listingId, 'saved');
-      await ctx.answerCbQuery('❤️ Listing saved to your favorites!');
-      
-      logger.info(`User ${user.id} saved listing ${listingId}`);
-    } catch (error) {
-      logger.error('Save listing error', error);
-      await ctx.answerCbQuery('❌ Error saving listing');
-    }
-  }
-
-  async handleHide(ctx) {
-    try {
-      const listingId = ctx.match[1];
-      const user = await database.getUserByTelegramId(ctx.from.id);
-      
-      await database.logInteraction(user.id, listingId, 'hidden');
-      await ctx.answerCbQuery('👎 Listing hidden from your results');
-      
-      logger.info(`User ${user.id} hid listing ${listingId}`);
-    } catch (error) {
-      logger.error('Hide listing error', error);
-      await ctx.answerCbQuery('❌ Error hiding listing');
-    }
+  delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 }
 

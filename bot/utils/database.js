@@ -1,172 +1,211 @@
 const { createClient } = require('@supabase/supabase-js');
-require('dotenv').config();
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
+const logger = require('./logger');
 
 class Database {
-  async createUser(telegramId, username, firstName) {
-    const { data, error } = await supabase
-      .from('users')
-      .insert([{
-        telegram_id: telegramId,
-        username: username,
-        first_name: firstName
-      }])
-      .select();
-    
-    if (error) throw error;
-    return data[0];
+  constructor() {
+    this.supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_ANON_KEY
+    );
+  }
+
+  async createUser(telegramId, username, firstName, lastName) {
+    try {
+      const { data, error } = await this.supabase
+        .from('users')
+        .insert([{
+          telegram_id: telegramId,
+          username: username,
+          first_name: firstName,
+          last_name: lastName
+        }])
+        .select()
+        .single();
+      
+      if (error) throw error;
+      logger.info(`Created user: ${telegramId}`);
+      return data;
+    } catch (error) {
+      logger.error('Create user error:', error);
+      throw error;
+    }
   }
 
   async getUserByTelegramId(telegramId) {
-    const { data, error } = await supabase
-      .from('users')
-      .select('*')
-      .eq('telegram_id', telegramId)
-      .single();
-    
-    if (error && error.code !== 'PGRST116') throw error;
-    return data;
+    try {
+      const { data, error } = await this.supabase
+        .from('users')
+        .select('*')
+        .eq('telegram_id', telegramId)
+        .single();
+      
+      if (error && error.code !== 'PGRST116') throw error;
+      return data;
+    } catch (error) {
+      logger.error('Get user error:', error);
+      return null;
+    }
   }
 
   async saveUserPreferences(userId, preferences) {
-    const { data, error } = await supabase
-      .from('user_preferences')
-      .upsert({
-        user_id: userId,
-        ...preferences,
-        updated_at: new Date()
-      });
-    
-    if (error) throw error;
-    return data;
+    try {
+      const { data, error } = await this.supabase
+        .from('user_preferences')
+        .upsert({
+          user_id: userId,
+          ...preferences,
+          updated_at: new Date()
+        })
+        .select()
+        .single();
+      
+      if (error) throw error;
+      logger.info(`Saved preferences for user: ${userId}`);
+      return data;
+    } catch (error) {
+      logger.error('Save preferences error:', error);
+      throw error;
+    }
+  }
+
+  async getUserPreferences(userId) {
+    try {
+      const { data, error } = await this.supabase
+        .from('user_preferences')
+        .select('*')
+        .eq('user_id', userId)
+        .single();
+      
+      if (error && error.code !== 'PGRST116') throw error;
+      return data;
+    } catch (error) {
+      logger.error('Get preferences error:', error);
+      return null;
+    }
   }
 
   async saveListings(listings) {
-    const { data, error } = await supabase
-      .from('listings')
-      .upsert(listings, { 
-        onConflict: 'listing_url',
-        ignoreDuplicates: false 
-      });
-    
-    if (error) throw error;
-    return data;
+    try {
+      const { data, error } = await this.supabase
+        .from('listings')
+        .upsert(listings, { 
+          onConflict: 'listing_url',
+          ignoreDuplicates: false 
+        })
+        .select();
+      
+      if (error) throw error;
+      logger.info(`Saved ${listings.length} listings`);
+      return data;
+    } catch (error) {
+      logger.error('Save listings error:', error);
+      throw error;
+    }
   }
 
   async getFilteredListings(preferences) {
-    let query = supabase
-      .from('listings')
-      .select('*')
-      .eq('is_active', true)
-      .gte('scraped_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+    try {
+      let query = this.supabase
+        .from('listings')
+        .select('*')
+        .eq('is_active', true)
+        .gte('scraped_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString());
 
-    if (preferences.location) {
-      query = query.ilike('location', `%${preferences.location}%`);
-    }
-    if (preferences.max_budget) {
-      query = query.lte('price', preferences.max_budget);
-    }
-    if (preferences.min_rooms) {
-      query = query.gte('rooms', preferences.min_rooms);
-    }
+      // Apply filters based on preferences
+      if (preferences.location && preferences.location !== 'Any') {
+        query = query.ilike('location', `%${preferences.location}%`);
+      }
+      
+      if (preferences.max_budget) {
+        query = query.or(`price.is.null,price.lte.${preferences.max_budget}`);
+      }
+      
+      if (preferences.min_rooms >= 0) {
+        query = query.gte('rooms', preferences.min_rooms);
+      }
 
-    const { data, error } = await query
-      .order('scraped_at', { ascending: false })
-      .limit(10);
+      if (preferences.furnished_preference && preferences.furnished_preference !== 'Any') {
+        const furnished = preferences.furnished_preference === 'Yes';
+        query = query.eq('furnished', furnished);
+      }
 
-    if (error) throw error;
-    return data;
+      const { data, error } = await query
+        .order('scraped_at', { ascending: false })
+        .limit(20);
+
+      if (error) throw error;
+      return data;
+    } catch (error) {
+      logger.error('Get filtered listings error:', error);
+      return [];
+    }
   }
+
+  async logInteraction(userId, listingId, action) {
+    try {
+      const { error } = await this.supabase
+        .from('user_interactions')
+        .insert({
+          user_id: userId,
+          listing_id: listingId,
+          action: action
+        });
+      
+      if (error) throw error;
+    } catch (error) {
+      logger.error('Log interaction error:', error);
+    }
+  }
+
   async getAllActiveUsers() {
-  const { data, error } = await supabase
-    .from('users')
-    .select('*')
-    .eq('is_active', true);
-  
-  if (error) throw error;
-  return data;
-}
+    try {
+      const { data, error } = await this.supabase
+        .from('users')
+        .select('*, user_preferences!inner(*)')
+        .eq('is_active', true);
+      
+      if (error) throw error;
+      return data;
+    } catch (error) {
+      logger.error('Get active users error:', error);
+      return [];
+    }
+  }
 
-async getUserPreferences(userId) {
-  const { data, error } = await supabase
-    .from('user_preferences')
-    .select('*')
-    .eq('user_id', userId)
-    .single();
-  
-  if (error && error.code !== 'PGRST116') throw error;
-  return data;
-}
+  async getNewListingsForUser(preferences, lastSentAt) {
+    try {
+      const since = lastSentAt || new Date(Date.now() - 24 * 60 * 60 * 1000);
+      
+      let query = this.supabase
+        .from('listings')
+        .select('*')
+        .eq('is_active', true)
+        .gte('scraped_at', since.toISOString());
 
-async deactivateUser(userId) {
-  const { error } = await supabase
-    .from('users')
-    .update({ is_active: false, updated_at: new Date() })
-    .eq('id', userId);
-  
-  if (error) throw error;
-}
+      // Apply user filters
+      if (preferences.location && preferences.location !== 'Any') {
+        query = query.ilike('location', `%${preferences.location}%`);
+      }
+      
+      if (preferences.max_budget) {
+        query = query.or(`price.is.null,price.lte.${preferences.max_budget}`);
+      }
+      
+      if (preferences.min_rooms >= 0) {
+        query = query.gte('rooms', preferences.min_rooms);
+      }
 
-async logInteraction(userId, listingId, action) {
-  const { error } = await supabase
-    .from('user_interactions')
-    .insert({
-      user_id: userId,
-      listing_id: listingId,
-      action: action
-    });
-  
-  if (error) throw error;
-}
+      const { data, error } = await query
+        .order('scraped_at', { ascending: false })
+        .limit(5);
 
-async getWeeklyStats() {
-  const weekAgo = new Date();
-  weekAgo.setDate(weekAgo.getDate() - 7);
-
-  const { data, error } = await supabase
-    .from('listings')
-    .select('source')
-    .gte('scraped_at', weekAgo.toISOString());
-  
-  if (error) throw error;
-  
-  // Group by source
-  const stats = data.reduce((acc, listing) => {
-    acc[listing.source] = (acc[listing.source] || 0) + 1;
-    return acc;
-  }, {});
-
-  return {
-    total_listings: data.length,
-    by_source: stats,
-    week_start: weekAgo
-  };
-}
-
-async getUserStats(userId) {
-  const weekAgo = new Date();
-  weekAgo.setDate(weekAgo.getDate() - 7);
-
-  const { data, error } = await supabase
-    .from('user_interactions')
-    .select('action')
-    .eq('user_id', userId)
-    .gte('created_at', weekAgo.toISOString());
-  
-  if (error) throw error;
-  
-  return {
-    total_interactions: data.length,
-    viewed: data.filter(i => i.action === 'viewed').length,
-    saved: data.filter(i => i.action === 'saved').length,
-    hidden: data.filter(i => i.action === 'hidden').length
-  };
-}
-
+      if (error) throw error;
+      return data;
+    } catch (error) {
+      logger.error('Get new listings error:', error);
+      return [];
+    }
+  }
 }
 
 module.exports = new Database();
