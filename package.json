@@ -1,0 +1,27 @@
+{
+  "name": "alfred-ai",
+  "version": "1.0.0",
+  "description": "Smart Telegram assistant for Bali rental properties",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "scrape": "node scrapers/index.js",
+    "test": "node test/test.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.15.0",
+    "puppeteer": "^21.5.0",
+    "playwright": "^1.40.0",
+    "@supabase/supabase-js": "^2.38.4",
+    "node-cron": "^3.0.3",
+    "axios": "^1.6.2",
+    "cheerio": "^1.0.0-rc.12",
+    "dotenv": "^16.3.1",
+    "uuid": "^9.0.1",
+    "moment": "^2.29.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
